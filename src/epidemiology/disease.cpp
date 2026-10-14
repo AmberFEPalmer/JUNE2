@@ -282,7 +282,7 @@ double Disease::evaluateStageDrivenInfectiousness(int mode_index,
 // =============================================================================
 
 Infection::Infection(const Disease* disease, double infection_time,
-                     const Person* person, unsigned int random_seed,
+                     const Person* person, uint64_t random_seed,
                      const TransmissionRecord& transmission,
                      const WorldState* world, const std::string& venue_type,
                      int venue_id, const std::string& trajectory_key_override,
@@ -375,27 +375,23 @@ double Infection::sampleFromDistribution(const DistributionParams& dist,
   } else if (dist.type == "normal") {
     double loc = dist.params.count("loc") ? dist.params.at("loc") : 0.0;
     double scale = dist.params.count("scale") ? dist.params.at("scale") : 1.0;
-    std::normal_distribution<double> d(loc, scale);
-    return std::max(0.0, d(rng));
+    if (!std::isfinite(loc) || !std::isfinite(scale))
+      throw std::runtime_error(
+          "normal distribution needs a finite loc and scale");
+    return std::max(0.0, loc + scale * normal01(rng));
   } else if (dist.type == "lognormal") {
     double s = dist.params.at("s");
     double loc = dist.params.at("loc");
     double scale = dist.params.at("scale");
-    std::lognormal_distribution<double> d(std::log(scale), s);
-    return loc + d(rng);
+    return lognormal(rng, loc, scale, s);
   } else if (dist.type == "beta") {
     double a = dist.params.at("a");
     double b = dist.params.at("b");
     double loc = dist.params.at("loc");
     double scale = dist.params.at("scale");
 
-    // Beta distribution using gamma distributions
-    std::gamma_distribution<double> gamma_a(a, 1.0);
-    std::gamma_distribution<double> gamma_b(b, 1.0);
-    double x = gamma_a(rng);
-    double y = gamma_b(rng);
-    double beta_sample = x / (x + y);
-    return loc + scale * beta_sample;
+    // Beta distribution from two gamma draws
+    return loc + scale * beta(rng, a, b);
   } else if (dist.type == "exponweib") {
     double a = dist.params.at("a");
     double c = dist.params.at("c");
@@ -403,8 +399,7 @@ double Infection::sampleFromDistribution(const DistributionParams& dist,
     double scale = dist.params.at("scale");
 
     // Exponentiated Weibull distribution
-    std::uniform_real_distribution<double> uniform(0.0, 1.0);
-    double u = uniform(rng);
+    double u = uniform01(rng);
     double weibull_sample = scale * std::pow(-std::log(1.0 - u), 1.0 / c);
     double exp_weibull = std::pow(weibull_sample, a);
     return loc + exp_weibull;
@@ -412,12 +407,13 @@ double Infection::sampleFromDistribution(const DistributionParams& dist,
     double shape = dist.params.at("shape");
     double scale = dist.params.at("scale");
     double loc = dist.params.count("loc") ? dist.params.at("loc") : 0.0;
-    std::gamma_distribution<double> d(shape, scale);
-    return loc + d(rng);
+    return loc + gamma(rng, shape, scale);
   }
 
-  // Default: return 0
-  std::cerr << "Unknown distribution type: " << dist.type << std::endl;
+  // An unset parameter (shape, rate, shift) has an empty type and means 0.
+  // Any other type that is not handled above is a config error.
+  if (!dist.type.empty())
+    throw std::runtime_error("Unknown distribution type '" + dist.type + "'");
   return 0.0;
 }
 
@@ -471,8 +467,7 @@ std::pair<std::vector<double>, double> Infection::gatherTrajectoryRates(
 int Infection::sampleTrajectoryIndex(const std::vector<double>& rates,
                                      double total_rate, SplitMix64& rng) {
   if (total_rate <= 0.0) return 0;
-  std::uniform_real_distribution<double> prob_dist(0.0, 1.0);
-  double rand_val = prob_dist(rng);
+  double rand_val = uniform01(rng);
   double cumulative = 0.0;
   for (size_t i = 0; i < rates.size(); ++i) {
     cumulative += rates[i];

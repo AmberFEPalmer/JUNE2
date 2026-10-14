@@ -110,6 +110,14 @@ output:
 | `output.flush_interval_days` | How often the event buffer is flushed to HDF5. |
 | `output.save_coordinated_encounters` | Write coordinated encounters to `/events/coordinated_encounters`. Default `false` — it's the largest dataset in `simulation_events.h5` and rarely needed for analysis; encounters still happen and still drive transmission either way, only the H5 record is skipped. |
 
+Every row of `/events/coordinated_encounters` carries a `group_id` that is
+shared by the rows of one encounter. It is built from the encounter itself, so
+it is the same at any rank count: the simulation day in bits 62 to 51 (up to
+4095), the host's running number for that day in bits 50 to 36 (up to 32767),
+and the host's person id in bits 35 to 0. The value is always positive as a
+signed 64 bit integer. A day, a count or a person id that does not fit stops
+the run with an error that names the value and the limit.
+
 > **Paths** are resolved relative to the working directory you launched
 > from (typically the repo root). All sample configs assume that.
 
@@ -588,10 +596,17 @@ campaigns:
   (`days_to_effective`), waning window, and per-disease, per-age-band
   efficacy against infection and symptoms. Efficacy multiplies the
   trajectory's `severity` to compute symptom protection.
-- A **campaign** rolls out a vaccine to a selected sub-population at
-  `daily_coverage` until end-date. `last_dose_type_filter` lets a
-  booster campaign target only people whose previous dose was a
-  specific brand.
+- A **campaign** offers a vaccine once a day, until end-date, to the
+  people its `selection` matches. Each campaign rolls independently for
+  each person each day, with `daily_coverage` as the chance. When
+  several campaigns are active, a person is checked against them in
+  file order and the first success takes them, so file order only
+  decides which vaccine they get. It does not change how many people
+  are reached: with coverages a and b the chance of a dose from either
+  in one day is 1 minus (1 minus a)(1 minus b). `last_dose_type_filter`
+  lets a booster campaign target only people whose previous dose was a
+  specific brand. The rolls depend on the run seed, so a different
+  `random_seed` vaccinates different people.
 
 ---
 
@@ -703,8 +718,7 @@ The fastest path:
 A run can be snapshotted at configurable points and later resumed. The
 continuation is **bit-identical to the uninterrupted run, regardless of
 the MPI rank count** used for either the checkpoint or the resume
-(set-identical events; the only cross-rank difference is the documented
-rank-stamped `coordinated_encounters.group_id`).
+(set-identical events, every field included).
 
 ### 17.1 Enabling checkpoints
 

@@ -195,6 +195,12 @@ endif()
 # Create the library
 add_library(june_core STATIC ${JUNE_CORE_SOURCES})
 
+# Fused multiply-add changes the last bit of the random draws, and the default
+# differs between compilers. Keep one rounding per operation everywhere.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(june_core PUBLIC -ffp-contract=off)
+endif()
+
 # GCC 15 false-positive: variant copy-assign with vector<int> triggers a
 # spurious -Wfree-nonheap-object due to broken alias analysis in the compiler.
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
@@ -314,6 +320,8 @@ if(BUILD_TESTING)
       test_simulator
 
       test_deterministic_rng
+      test_event_record_layout
+      test_encounter_group_id_rank_independent
 
       test_transmission_determinism
 
