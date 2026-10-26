@@ -35,13 +35,13 @@ def unit_to_level(world_path, level="MGU"):
     target = level_names.index(level)
     row = {int(i): k for k, i in enumerate(ids)}
     out = {}
+    ### units above `level` (local authorities, regions) reach the top without meeting it: skipped
     for i in ids:
         k = row[int(i)]
-        while levels[k] != target:
-            if int(parents[k]) not in row:
-                raise ValueError(f"geo unit {int(i)} ({names[row[int(i)]]}) has no {level} ancestor")
+        while levels[k] != target and int(parents[k]) in row:
             k = row[int(parents[k])]
-        out[int(i)] = names[k]
+        if levels[k] == target:
+            out[int(i)] = names[k]
     return out
 
 
@@ -77,6 +77,10 @@ def main():
     msoa_of = unit_to_level(args.world)
     codes = sorted(set(msoa_of.values()))
     unit_ids = np.array(sorted(msoa_of))
+    homeless = ~np.isin(geo[pos], unit_ids)
+    if homeless.any():
+        raise ValueError(f"{int(homeless.sum())} infections are in geo units with no MGU above them, "
+                         f"e.g. unit {int(geo[pos][homeless][0])}")
     column = {c: k for k, c in enumerate(codes)}
     unit_col = np.array([column[msoa_of[u]] for u in unit_ids.tolist()])
     col = unit_col[np.searchsorted(unit_ids, geo[pos])]
