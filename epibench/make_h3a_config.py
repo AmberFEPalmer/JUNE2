@@ -76,6 +76,9 @@ def main():
     p.add_argument("--seed-msoa", required=True)
     p.add_argument("--seed-infections", type=int, default=20)
     p.add_argument("--run-seed", required=True, type=int)
+    p.add_argument("--no-friendships", action="store_true",
+                   help="for worlds built without MAY's friendship network: turn off the "
+                        "friend-to-friend social encounters that need it")
     args = p.parse_args()
 
     out = args.out
@@ -107,6 +110,11 @@ def main():
     if n_beta == 0:
         raise ValueError("no beta values found in contact_matrices.yaml")
     (out / "contact_matrices.yaml").write_text(contacts)
+
+    if args.no_friendships:
+        enc = (out / "coordinated_encounters.yaml").read_text()
+        enc = _sub(enc, r'(name: "social_encounters"\s*\n\s*priority: \d+\s*\n\s*)enabled: true', r"\1enabled: false")
+        (out / "coordinated_encounters.yaml").write_text(enc)
 
     if "enabled: false" not in (out / "vaccines.yaml").read_text():
         raise ValueError("vaccines.yaml no longer has vaccination disabled")
