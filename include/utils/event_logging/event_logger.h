@@ -16,8 +16,7 @@ namespace event_writer {
 void saveToHDF5WithLookups(
     const EventLogger& logger, const std::string& filename,
     const WorldState& world, const Config& config,
-    const std::unordered_set<PersonId>& infected_person_ids,
-    const std::unordered_set<PersonId>* person_ids_filter);
+    const std::unordered_set<PersonId>& person_ids_filter);
 }
 
 // =============================================================================
@@ -51,18 +50,27 @@ class EventLogger {
                                uint64_t group_id);
   void logFollow(PersonId host, PersonId follower, double time, uint8_t rule_id,
                  int slot);
+  // The counts are whole-world totals that every rank already holds, and the
+  // logger does not know its rank. Per-rank files are concatenated when they
+  // are merged, so a caller that logged on every rank would write each row once
+  // per rank: log from rank 0 only.
+  void logCampaignDay(int day, uint16_t campaign_id, uint16_t tier_id,
+                      int64_t candidates, int64_t doses_given, int64_t declined,
+                      int64_t allotment, int64_t started_total);
 
   // Save all events + lookup tables to HDF5 file (with config-based selective
   // saving)
+  // `person_ids_filter` is the people whose lookup rows this write adds; an
+  // empty one adds none.
   void saveToHDF5WithLookups(
       const std::string& filename, const WorldState& world,
       const Config& config,
-      const std::unordered_set<PersonId>* person_ids_filter = nullptr);
+      const std::unordered_set<PersonId>& person_ids_filter);
 
   // Flush current buffers to a specific file (incremental)
   void flush(const std::string& filename, const Config& config,
              const WorldState& world,
-             const std::unordered_set<PersonId>* person_ids_filter = nullptr);
+             const std::unordered_set<PersonId>& person_ids_filter);
 
   // Clear all events (useful for starting fresh)
   void clear();
@@ -90,7 +98,7 @@ class EventLogger {
            hospital_admissions_.size() + icu_admissions_.size() +
            hospital_discharges_.size() + vaccinations_.size() +
            relationships_.size() + coordinated_encounters_.size() +
-           follows_.size();
+           follows_.size() + campaign_days_.size();
   }
 
   size_t getInfectionCount() const { return infections_.size(); }
@@ -107,6 +115,9 @@ class EventLogger {
     return hospital_discharges_.size();
   }
   size_t getVaccinationCount() const { return vaccinations_.size(); }
+  const std::vector<CampaignDayEvent>& getCampaignDayEvents() const {
+    return campaign_days_;
+  }
   size_t getRelationshipCount() const { return relationships_.size(); }
   size_t getCoordinatedEncounterCount() const {
     return coordinated_encounters_.size();
@@ -119,8 +130,7 @@ class EventLogger {
   friend void event_writer::saveToHDF5WithLookups(
       const EventLogger& logger, const std::string& filename,
       const WorldState& world, const Config& config,
-      const std::unordered_set<PersonId>& infected_person_ids,
-      const std::unordered_set<PersonId>* person_ids_filter);
+      const std::unordered_set<PersonId>& person_ids_filter);
 
   std::vector<InfectionEvent> infections_;
   std::vector<SymptomChangeEvent> symptom_changes_;
@@ -132,6 +142,7 @@ class EventLogger {
   std::vector<RelationshipEvent> relationships_;
   std::vector<CoordinatedEncounterEvent> coordinated_encounters_;
   std::vector<FollowEvent> follows_;
+  std::vector<CampaignDayEvent> campaign_days_;
 
   std::vector<size_t> scheduled_encounters_;  // per day type index
   std::vector<size_t> actual_encounters_;     // per day type index

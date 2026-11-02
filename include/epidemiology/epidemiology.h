@@ -12,6 +12,7 @@
 namespace june {
 
 class PolicyManager;
+class ObservedMetrics;
 
 struct EpiSlotStats {
   int transitions = 0;
@@ -26,7 +27,8 @@ class Epidemiology {
                EventLogger* event_logger = nullptr);
 
   // Update infection states (symptom changes, recoveries, deaths) for all
-  // actively infected people
+  // actively infected people. Every transition up to current_simulation_time
+  // is applied, so the caller passes the end of the slot it has just run.
   EpiSlotStats updateInfectionStates(
       double current_simulation_time,
       const std::vector<PersonLocation>& locations);
@@ -41,6 +43,16 @@ class Epidemiology {
   void setPolicyManager(PolicyManager* policy_manager) {
     policy_manager_ = policy_manager;
   }
+
+  // Observed metrics. Left null unless some Policy trigger reads a metric, so
+  // a run with none only tests a null pointer where the counting hooks sit.
+  void setObservedMetrics(ObservedMetrics* metrics) {
+    observed_metrics_ = metrics;
+  }
+
+  // End of day: scan present state for current metrics, then reduce all
+  // active metrics across ranks. No-op when no metric is active.
+  void reduceObservedMetrics();
 
   // Track a newly infected person
   void trackInfection(PersonId pid);
@@ -84,6 +96,11 @@ class Epidemiology {
   const Disease* disease_;
   EventLogger* event_logger_;
   PolicyManager* policy_manager_ = nullptr;
+  ObservedMetrics* observed_metrics_ = nullptr;
+  // Time of the last updateInfectionStates, so the daily scan reads the same
+  // present state the engine itself last acted on. Only kept while observed
+  // metrics are attached.
+  double last_update_time_ = 0.0;
 
   // Only track people who are currently infected
   std::unordered_set<PersonId> active_infections_;

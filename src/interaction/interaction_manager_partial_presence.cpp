@@ -273,8 +273,9 @@ InteractionManager::buildPartialPresenceGroups(
     const float f_presence =
         runtime_group_allocator_->getPresenceFactor(actual_venue_id, m.id);
 
-    int matrix_bin = computeBinIndexForMatrix(person, venue, m.subset_index,
-                                              &bin_structure, num_bins_needed);
+    int matrix_bin =
+        computeBinIndexForMatrix(person, visitor, venue, m.subset_index,
+                                 &bin_structure, num_bins_needed);
     if (matrix_bin < 0 || matrix_bin >= num_bins_needed) matrix_bin = 0;
 
     groups[group].push_back(RuntimeGroupMember{
@@ -405,7 +406,12 @@ int InteractionManager::processPartialPresenceLines(
                                std::to_string(vid) +
                                " but the venue is not in its world");
 
-    const auto& riders = runtime_group_allocator_->ridersByVenue().at(vid);
+    // A line can end a slot with nobody aboard: its riders may all have been
+    // placed elsewhere (followers who left their own journey, say).
+    const auto& by_venue = runtime_group_allocator_->ridersByVenue();
+    auto riders_it = by_venue.find(vid);
+    if (riders_it == by_venue.end()) continue;
+    const auto& riders = riders_it->second;
     members.clear();
     members.reserve(riders.size());
     for (const auto& r : riders) {

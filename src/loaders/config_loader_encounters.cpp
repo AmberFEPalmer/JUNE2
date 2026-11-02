@@ -18,6 +18,8 @@ namespace june {
 
 namespace {
 
+using ::june::config_detail::rejectUnknownKeys;
+
 // Map a frequency-group `rate_unit` literal (e.g. "per_month") onto the
 // number of days it covers. Used to convert raw CSV rates into a daily
 // probability (raw / divisor). Throws if the unit is not recognised.
@@ -39,6 +41,9 @@ FrequencyGroup parseFrequencyGroup(const std::string& name,
                                    const YAML::Node& gnode) {
   FrequencyGroup fg;
   fg.name = name;
+  rejectUnknownKeys(
+      gnode, {"csv", "rate_column", "rate_unit"},
+      "coordinated_encounters: ", " in frequency_group '" + name + "'");
   if (!gnode["csv"])
     throw std::runtime_error("frequency_group '" + fg.name +
                              "' missing required field: csv");
@@ -95,7 +100,8 @@ enum class InviteDistributionMode { REQUIRED, OPTIONAL };
 void parseInviteDistribution(const YAML::Node& dist_node,
                              InviteDistribution& dist,
                              const std::string& enc_name,
-                             InviteDistributionMode mode) {
+                             InviteDistributionMode mode,
+                             const char* dist_label) {
   if (dist_node["type"]) {
     dist.type = parseDistributionType(dist_node["type"].as<std::string>());
   } else if (mode == InviteDistributionMode::REQUIRED) {
@@ -107,6 +113,10 @@ void parseInviteDistribution(const YAML::Node& dist_node,
   const char* parameter = dist.type == DistributionType::POISSON    ? "mean"
                           : dist.type == DistributionType::BINOMIAL ? "p"
                                                                     : "count";
+
+  rejectUnknownKeys(dist_node, {"type", parameter},
+                    "Coordinated encounter '" + enc_name + "': ",
+                    " in '" + std::string(dist_label) + "'");
 
   if (!dist_node[parameter]) {
     if (mode == InviteDistributionMode::REQUIRED) {
@@ -151,6 +161,13 @@ void parseEncounterRequiredFields(const YAML::Node& enc_node,
     throw std::runtime_error(
         "Coordinated encounter missing required field: name");
   enc_def.name = enc_node["name"].as<std::string>();
+  rejectUnknownKeys(
+      enc_node,
+      {"name", "enabled", "network", "trigger_slots", "allowed_venues",
+       "proposal_probability", "invite_distribution", "acceptance_probability",
+       "is_virtual", "virtual_contact_matrix", "min_attendees", "priority",
+       "frequency_group", "daily_max_distribution"},
+      "coordinated_encounters: ", " in encounter '" + enc_def.name + "'");
 
   if (enc_node["enabled"]) {
     enc_def.enabled = enc_node["enabled"].as<bool>();
@@ -237,9 +254,9 @@ CoordinatedEncounterDef parseEncounter(
   if (!enc_node["invite_distribution"])
     throw std::runtime_error("Coordinated encounter '" + enc_def.name +
                              "' missing required field: invite_distribution");
-  parseInviteDistribution(enc_node["invite_distribution"],
-                          enc_def.invite_distribution, enc_def.name,
-                          InviteDistributionMode::REQUIRED);
+  parseInviteDistribution(
+      enc_node["invite_distribution"], enc_def.invite_distribution,
+      enc_def.name, InviteDistributionMode::REQUIRED, "invite_distribution");
 
   // acceptance_probability is optional. When absent, defaults to 1.0
   // (no refusal), which is appropriate whenever a frequency CSV is the
@@ -274,7 +291,8 @@ CoordinatedEncounterDef parseEncounter(
   if (enc_node["daily_max_distribution"]) {
     parseInviteDistribution(enc_node["daily_max_distribution"],
                             enc_def.daily_max_distribution, enc_def.name,
-                            InviteDistributionMode::OPTIONAL);
+                            InviteDistributionMode::OPTIONAL,
+                            "daily_max_distribution");
   }
 
   return enc_def;
@@ -297,8 +315,12 @@ CoordinatedEncounterConfig ConfigLoader::loadCoordinatedEncounters(
         "coordinated_encounters file " + filename +
         " parsed to a null root node (file empty or malformed).");
   }
+  rejectUnknownKeys(root, {"coordinated_encounters"}, filename + ": ");
   if (!root["coordinated_encounters"]) return config;
   const auto& ce_node = root["coordinated_encounters"];
+  rejectUnknownKeys(ce_node,
+                    {"enabled", "frequency_groups", "encounters", "follows"},
+                    filename + ": ", " in 'coordinated_encounters'");
 
   if (ce_node["enabled"]) {
     config.enabled = ce_node["enabled"].as<bool>();
@@ -351,11 +373,52 @@ CoordinatedEncounterConfig ConfigLoader::loadCoordinatedEncounters(
   };
   auto parseFollowRule = [&](const YAML::Node& fn) {
     FollowConfig f;
+    rejectUnknownKeys(
+        fn,
+        {"name", "enabled", "pool", "encounter_type", "probability",
+         "max_followers", "log", "establishment", "span", "eligibility",
+         "host_eligibility", "activity_exceptions", "venue_exceptions",
+         "follower_activity_exceptions"},
+        filename + ": ",
+        " in follow rule '" +
+            (fn["name"] ? fn["name"].as<std::string>()
+                        : std::string("unnamed")) +
+            "'");
     if (fn["name"]) f.name = fn["name"].as<std::string>();
     if (fn["enabled"]) f.enabled = fn["enabled"].as<bool>();
-    if (fn["pool_venue_type"])
-      f.pool_venue_type = fn["pool_venue_type"].as<std::string>();
-    if (fn["network"]) f.network = fn["network"].as<std::string>();
+    if (fn["pool"]) {
+      const YAML::Node& pn = fn["pool"];
+      if (!pn.IsMap())
+        throw std::runtime_error(
+            filename +
+            ": follow.pool must be a mapping with 'venue_types' "
+            "or 'network'");
+      rejectUnknownKeys(pn, {"venue_types", "network", "venue_choice"},
+                        filename + ": ", " in follow.pool");
+      if (pn["venue_types"]) {
+        if (!pn["venue_types"].IsSequence())
+          throw std::runtime_error(filename +
+                                   ": follow.pool.venue_types must be a list");
+        for (const auto& vt : pn["venue_types"])
+          f.pool.venue_types.push_back(vt.as<std::string>());
+      }
+      if (pn["network"]) f.pool.network = pn["network"].as<std::string>();
+      if (pn["venue_choice"]) {
+        std::string c = pn["venue_choice"].as<std::string>();
+        if (c == "all")
+          f.pool.venue_choice = FollowPool::VenueChoice::All;
+        else if (c == "lowest_id")
+          f.pool.venue_choice = FollowPool::VenueChoice::LowestId;
+        else if (c == "random")
+          f.pool.venue_choice = FollowPool::VenueChoice::Random;
+        else
+          throw std::runtime_error(filename +
+                                   ": follow.pool.venue_choice must be 'all', "
+                                   "'lowest_id' or 'random', got '" +
+                                   c + "'");
+      }
+    }
+    if (fn["max_followers"]) f.max_followers = fn["max_followers"].as<int>();
     if (fn["encounter_type"])
       f.encounter_type = fn["encounter_type"].as<std::string>();
     if (fn["probability"]) f.probability = fn["probability"].as<double>();
@@ -400,14 +463,7 @@ CoordinatedEncounterConfig ConfigLoader::loadCoordinatedEncounters(
     return f;
   };
 
-  if (ce_node["follow"] && ce_node["follows"]) {
-    throw std::runtime_error(
-        "coordinated_encounters: set either 'follow' (one rule) or 'follows' "
-        "(a list), not both");
-  }
-  if (ce_node["follow"]) {
-    config.follows.push_back(parseFollowRule(ce_node["follow"]));
-  } else if (ce_node["follows"]) {
+  if (ce_node["follows"]) {
     for (const auto& fn : ce_node["follows"])
       config.follows.push_back(parseFollowRule(fn));
   }

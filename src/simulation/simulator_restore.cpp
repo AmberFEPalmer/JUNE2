@@ -12,6 +12,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "simulation/simulator.h"
@@ -21,10 +22,21 @@ namespace {
 
 namespace fs = std::filesystem;
 
+// Every dataset below is created by the writer even when it has no rows, so a
+// missing one means a truncated or damaged file. Resuming from the rest of it
+// would drop state without saying so, which is why a read throws. A section
+// that may legitimately be absent is tested for by its group before any read.
+void requireDataset(H5::H5File& f, const std::string& n) {
+  if (H5Lexists(f.getId(), n.c_str(), H5P_DEFAULT) <= 0)
+    throw std::runtime_error(
+        "restoreFromCheckpoint: checkpoint is missing " + n +
+        " (incomplete or damaged checkpoint): " + f.getFileName());
+}
+
 template <typename T>
 std::vector<T> readVec(H5::H5File& f, const std::string& n,
                        const H5::PredType& t) {
-  if (!H5Lexists(f.getId(), n.c_str(), H5P_DEFAULT)) return {};
+  requireDataset(f, n);
   H5::DataSet d = f.openDataSet(n);
   hsize_t dim[1];
   d.getSpace().getSimpleExtentDims(dim);
@@ -34,7 +46,7 @@ std::vector<T> readVec(H5::H5File& f, const std::string& n,
 }
 
 std::vector<std::string> readStrs(H5::H5File& f, const std::string& n) {
-  if (!H5Lexists(f.getId(), n.c_str(), H5P_DEFAULT)) return {};
+  requireDataset(f, n);
   H5::DataSet d = f.openDataSet(n);
   hsize_t dim[1];
   d.getSpace().getSimpleExtentDims(dim);
@@ -90,8 +102,9 @@ void overlayShardManagerState(
 
   // Follows: keep a relationship if THIS rank owns the follower, and a
   // tried-host if it owns the host. Each stochastic rule has its own named
-  // subgroup; a criteria rule wrote none and rebuilds itself. Guarded so
-  // checkpoints predating the follow feature still restore.
+  // subgroup; a criteria rule wrote none and rebuilds itself, and a rule added
+  // since the checkpoint has nothing to restore. So a rule with no subgroup is
+  // skipped, and a subgroup that is present must be complete.
   if (H5Lexists(f.getId(), "/follow", H5P_DEFAULT) > 0) {
     for (size_t ri = 0; ri < follow_names.size(); ++ri) {
       const std::string g = "/follow/" + follow_names[ri];
@@ -228,6 +241,7 @@ size_t overlayShardVaccine(H5::H5File& f, WorldState& world,
   auto dcnt = readVec<int32_t>(f, "/vaccine/dose_counts", I32);
   auto dnum = readVec<int32_t>(f, "/vaccine/dose_number", I32);
   auto dad = readVec<double>(f, "/vaccine/dose_day_administered", F64);
+  auto donset = readVec<double>(f, "/vaccine/dose_days_to_onset", F64);
   auto deff = readVec<double>(f, "/vaccine/dose_days_to_effective", F64);
   auto dwan = readVec<double>(f, "/vaccine/dose_days_to_waning", F64);
   auto dfin = readVec<double>(f, "/vaccine/dose_days_to_finished", F64);
@@ -245,6 +259,7 @@ size_t overlayShardVaccine(H5::H5File& f, WorldState& world,
       Dose d;
       d.number = dnum[off + k];
       d.day_administered = dad[off + k];
+      d.days_to_onset = donset[off + k];
       d.days_to_effective = deff[off + k];
       d.days_to_waning = dwan[off + k];
       d.days_to_finished = dfin[off + k];
@@ -293,6 +308,8 @@ size_t overlayShardFomite(H5::H5File& f, WorldState& world) {
 
 void overlayShardCalendarEvents(H5::H5File& f, WorldState& world,
                                 CalendarEventManager::Snapshot& snap) {
+  // The group is written only while some event is active, so a shard without
+  // it is normal.
   if (!f.exists("/calendar_events")) return;
   const auto I32 = H5::PredType::NATIVE_INT32;
   auto pids = readVec<int32_t>(f, "/calendar_events/person_ids", I32);
@@ -305,6 +322,9 @@ void overlayShardCalendarEvents(H5::H5File& f, WorldState& world,
 // Open the checkpoint's manifest.yaml, enforce that the checkpoint's seed
 // matches the configured seed (no silent override), and return the
 // completed_day to resume from. The caller has already canonicalised cp.
+// Only the layout this build writes is read: a checkpoint from any other
+// format_version throws, so no reader below needs a case for data an older
+// build did not write. Change this together with writeManifest.
 int readAndValidateManifest(const fs::path& cp, unsigned int config_seed) {
   if (!fs::exists(cp / "manifest.yaml"))
     throw std::runtime_error(
@@ -312,6 +332,13 @@ int readAndValidateManifest(const fs::path& cp, unsigned int config_seed) {
         "checkpoint): " +
         cp.string());
   YAML::Node man = YAML::LoadFile((cp / "manifest.yaml").string());
+  const int format_version = man["format_version"].as<int>();
+  if (format_version != 3) {
+    throw std::runtime_error(
+        "restoreFromCheckpoint: unsupported checkpoint format_version " +
+        std::to_string(format_version) +
+        " (this build reads only 3): " + cp.string());
+  }
   int completed_day = man["completed_day"].as<int>();
   unsigned int cp_seed = man["effective_random_seed"].as<unsigned int>();
   if (cp_seed != config_seed) {
@@ -321,6 +348,87 @@ int readAndValidateManifest(const fs::path& cp, unsigned int config_seed) {
         "). Resume with the checkpoint's seed (no silent override).");
   }
   return completed_day;
+}
+
+// Observed metric totals stored in state.h5, name order. Absent group means
+// the checkpoint was written with no active metric. The rows of the unit table
+// are (metric index, unit, value).
+std::vector<MetricSnapshot> readStoredMetrics(const fs::path& cp) {
+  H5::H5File f((cp / "state.h5").string(), H5F_ACC_RDONLY);
+  if (H5Lexists(f.getId(), "/observed_metrics", H5P_DEFAULT) <= 0) return {};
+  const auto names = readStrs(f, "/observed_metrics/names");
+  const auto values = readVec<int64_t>(f, "/observed_metrics/values",
+                                       H5::PredType::NATIVE_INT64);
+  const auto scopes = readVec<int64_t>(f, "/observed_metrics/scopes",
+                                       H5::PredType::NATIVE_INT64);
+  const auto rows = readVec<int64_t>(f, "/observed_metrics/unit_rows",
+                                     H5::PredType::NATIVE_INT64);
+  if (values.size() != names.size() || scopes.size() != names.size() ||
+      rows.size() % 3 != 0) {
+    throw std::runtime_error(
+        "restoreFromCheckpoint: observed_metrics arrays differ in length in " +
+        (cp / "state.h5").string());
+  }
+  std::vector<MetricSnapshot> out(names.size());
+  for (size_t i = 0; i < names.size(); ++i) {
+    out[i].name = names[i];
+    out[i].scope = static_cast<MetricScope>(scopes[i]);
+    out[i].value = values[i];
+  }
+  for (size_t r = 0; r < rows.size(); r += 3) {
+    if (rows[r] < 0 || static_cast<size_t>(rows[r]) >= names.size()) {
+      throw std::runtime_error(
+          "restoreFromCheckpoint: observed_metrics unit row names metric " +
+          std::to_string(rows[r]) + " but the checkpoint holds " +
+          std::to_string(names.size()) + " in " + (cp / "state.h5").string());
+    }
+    out[rows[r]].units.emplace_back(static_cast<VenueId>(rows[r + 1]),
+                                    rows[r + 2]);
+  }
+  return out;
+}
+
+// Policy trigger state stored in state.h5. Absent group means the checkpoint
+// was written with no triggered Policy. The rows of the unit table are
+// (trigger index, unit, closed, anchor day, anchor value).
+std::vector<PolicyManager::TriggerState> readStoredTriggers(
+    const fs::path& cp) {
+  H5::H5File f((cp / "state.h5").string(), H5F_ACC_RDONLY);
+  if (H5Lexists(f.getId(), "/policy_triggers", H5P_DEFAULT) <= 0) return {};
+  const auto keys = readStrs(f, "/policy_triggers/keys");
+  const auto state =
+      readVec<int64_t>(f, "/policy_triggers/state", H5::PredType::NATIVE_INT64);
+  const auto scopes = readVec<int64_t>(f, "/policy_triggers/scopes",
+                                       H5::PredType::NATIVE_INT64);
+  const auto voluntary = readVec<int64_t>(f, "/policy_triggers/voluntary",
+                                          H5::PredType::NATIVE_INT64);
+  const auto rows = readVec<int64_t>(f, "/policy_triggers/unit_rows",
+                                     H5::PredType::NATIVE_INT64);
+  if (state.size() != 3 * keys.size() || scopes.size() != keys.size() ||
+      voluntary.size() != keys.size() || rows.size() % 5 != 0) {
+    throw std::runtime_error(
+        "restoreFromCheckpoint: policy_triggers arrays differ in length in " +
+        (cp / "state.h5").string());
+  }
+  std::vector<PolicyManager::TriggerState> out(keys.size());
+  for (size_t i = 0; i < keys.size(); ++i) {
+    out[i].key = keys[i];
+    out[i].cell = {state[3 * i] != 0, state[3 * i + 1], state[3 * i + 2]};
+    out[i].scope = static_cast<MetricScope>(scopes[i]);
+    out[i].voluntary = voluntary[i] != 0;
+  }
+  for (size_t r = 0; r < rows.size(); r += 5) {
+    if (rows[r] < 0 || static_cast<size_t>(rows[r]) >= keys.size()) {
+      throw std::runtime_error(
+          "restoreFromCheckpoint: policy_triggers unit row names trigger " +
+          std::to_string(rows[r]) + " but the checkpoint holds " +
+          std::to_string(keys.size()) + " in " + (cp / "state.h5").string());
+    }
+    out[rows[r]].units.emplace_back(
+        static_cast<VenueId>(rows[r + 1]),
+        TriggerCell{rows[r + 2] != 0, rows[r + 3], rows[r + 4]});
+  }
+  return out;
 }
 
 }  // namespace
@@ -359,6 +467,16 @@ void Simulator::restoreFromCheckpoint(const std::string& checkpoint_dir) {
 
   restoreCheckpointStateFile(cp);
 
+  // A cumulative counter cannot be rebuilt, so a checkpoint that does not
+  // hold exactly the active metrics is refused rather than restarted at zero.
+  if (policy_manager_) {
+    auto& metrics = policy_manager_->observedMetrics();
+    metrics.restoreSnapshot(readStoredMetrics(cp));
+    policy_manager_->restoreTriggerStates(readStoredTriggers(cp));
+    // The levels are derived from the metric counts just put back.
+    policy_manager_->rebuildResponseLevels();
+  }
+
   // frozen_states_ + lpt + follows are per-rank: accumulated from the shards.
   // Follows accumulate one entry per rule, matched to its shard by name.
   const auto& follow_rules = config_.coordinated_encounters.follows;
@@ -378,7 +496,13 @@ void Simulator::restoreFromCheckpoint(const std::string& checkpoint_dir) {
   CalendarEventManager::Snapshot ce_snap;
   for (int s = 0; s < n_shards; ++s) {
     fs::path sf = cp / ("delta_rank" + std::to_string(s) + ".h5");
-    if (!fs::exists(sf)) continue;
+    // Every rank writes its shard, even with no people, so one that is not
+    // there is a damaged checkpoint and its people would be left unrestored.
+    if (!fs::exists(sf))
+      throw std::runtime_error(
+          "restoreFromCheckpoint: checkpoint is missing its shard for rank " +
+          std::to_string(s) +
+          " (incomplete or damaged checkpoint): " + sf.string());
     H5::H5File f(sf.string(), H5F_ACC_RDONLY);
     n_people += overlayShardPopulation(f, world_);
     n_inf += overlayShardInfection(f, world_, disease_.get());

@@ -409,11 +409,13 @@ struct ScheduleConfig {
 // =============================================================================
 
 struct DoseConfig {
-  int number;
-  double days_to_effective;
-  double days_to_waning;
-  double days_to_finished;
+  int number = 0;
+  double days_to_effective = 0.0;
+  double days_to_waning = 0.0;
+  double days_to_finished = 0.0;
   double waning_factor = 1.0;
+  // Days after the dose with no protection, before the rise to the peak
+  double days_to_onset = 0.0;
 
   // Disease Name -> list of age-stratified efficacies
   std::unordered_map<std::string, std::vector<AgeEfficacy>> infection_efficacy;
@@ -425,28 +427,96 @@ struct VaccineConfig {
   std::vector<DoseConfig> doses;
 };
 
+// How the deciders' probabilities of a shared unit become one probability
+enum class DeciderCombine { Min, Mean, Max };
+
+// What a shared unit inside the scope does when none of its members decides
+enum class NoDecider { Error, Individual };
+
+// Who shares one decision. A person decides alone, or everyone registered to
+// the same venue for a named activity decides together.
+struct DecisionUnit {
+  std::string shared_activity;  // empty: the person decides alone
+  int16_t activity_index = -1;  // shared_activity in the world, set on resolve
+
+  bool shared() const { return !shared_activity.empty(); }
+};
+
+// How a vaccination tier's shared unit decides: who is inside the unit (people
+// outside decide alone), which members decide for it, how their probabilities
+// combine and what a unit with no decider does. An empty list matches
+// everyone. Read only when the tier's decision unit is shared.
+struct DecisionRules {
+  std::vector<SelectionCriterion> scope;
+  std::vector<SelectionCriterion> deciders;
+  DeciderCombine combine = DeciderCombine::Mean;
+  NoDecider if_no_decider = NoDecider::Error;
+};
+
+// A delivery rate: `doses` every `per_days` days.
+struct DoseBudget {
+  int64_t doses = 0;
+  int64_t per_days = 0;
+};
+
+// One row of an uptake table. An empty criteria list matches everyone.
+struct UptakeRow {
+  std::vector<SelectionCriterion> criteria;
+  double probability = 1.0;
+};
+
+// The probability that a person accepts a dose. Rows are tried in order and the
+// first match wins. A table read from a file keeps only the path until
+// resolve(world), because its criteria need the world.
+struct UptakeTable {
+  std::vector<UptakeRow> rows;
+  std::string csv_path;
+
+  // The first matching row, nullopt when no row matches, and 1.0 when there is
+  // no table at all.
+  std::optional<double> probability(const Person& person,
+                                    const WorldState& world) const;
+
+  // Read the file (if any), then resolve every row's criteria. `label` names
+  // the campaign and tier for error messages.
+  void resolve(const WorldState& world, const std::string& label);
+};
+
+// One step of a campaign's strict priority order: who it covers, which dose it
+// gives them, and how they decide to accept.
+struct VaccinationTier {
+  std::string name;
+  int dose = 0;  // same numbering as DoseConfig::number
+  std::vector<SelectionCriterion> selection_criteria;
+  UptakeTable uptake;
+  DecisionUnit decision_unit;
+  DecisionRules decision_rules;
+
+  void resolve(const WorldState& world, const std::string& campaign);
+};
+
 struct VaccinationCampaignConfig {
   std::string name;
   std::string start_date;
   std::string end_date;
 
   std::string vaccine_type;
-  std::vector<int> dose_sequence;
   std::vector<double> days_to_next_dose;  // Time between doses in sequence
 
-  double daily_coverage = 0.0;
+  // Optional: the vaccines a person's course may have begun with, for a
+  // campaign that goes on with other vaccines' courses (a booster). Empty
+  // means only the campaign's own vaccine.
+  std::vector<std::string> courses_begun_with;
 
-  // Selection criteria for eligibility
-  std::vector<SelectionCriterion> selection_criteria;
-
-  // Optional: filter by previous vaccine type (for boosters)
-  std::vector<std::string> last_dose_type_filter;
+  // Absent budget means unlimited doses; absent target means no cap on first
+  // doses.
+  std::optional<DoseBudget> dose_budget;
+  std::optional<double> coverage_target;
+  // Served strictly in this order
+  std::vector<VaccinationTier> tiers;
 
   void resolve(const WorldState& world) {
-    for (auto& crit : selection_criteria) {
-      crit.resolveOrThrow(world,
-                          "vaccination campaign '" + name + "' selection");
-    }
+    for (auto& tier : tiers) tier.resolve(world, name);
   }
 };
 
@@ -711,8 +781,12 @@ struct SimulationConfig {
   int max_event_buffer_size = 100000;
   bool save_population_summary = true;
   bool save_coordinated_encounters = false;  // largest H5 dataset; opt-in
+  // When the config names no summary_properties, the three defaults below are
+  // used and any a world does not carry are left out. Names the config writes
+  // itself must all exist (see checkSummaryProperties).
   std::vector<std::string> summary_properties = {
       "ethnicity", "has_comorbidities", "work_mode"};
+  bool summary_properties_explicit = false;
 
   // Checkpoint / restart. Cadence is MUTUALLY EXCLUSIVE: if on_dates is
   // present (non-null, non-empty) it takes precedence and every_n_days is
@@ -779,6 +853,15 @@ struct SimulationConfig {
   } partial_presence;
 
   void resolve(const WorldState& world);
+
+  // The properties the population summary stores: the configured names after
+  // checkSummaryProperties, or the defaults the world carries.
+  std::vector<std::string> summaryPropertiesFor(const WorldState& world) const;
+
+  // Throws unless every name is a person property of the world and there are
+  // at most 4 of them.
+  static void checkSummaryProperties(const WorldState& world,
+                                     const std::vector<std::string>& names);
 };
 
 // =============================================================================
@@ -864,6 +947,20 @@ struct FrequencyGroup {
 // subsystem has three independent settings: which pool a host's followers come
 // from, how the binding forms (establishment), and how long it lasts (span).
 
+// Where a host's followers come from: the co-members of its venues of the named
+// types, or its partners in a network. Exactly one of the two is set. A person
+// can be assigned to several venues of a type (a child with two homes), and
+// venue_choice says which of them feed the pool.
+struct FollowPool {
+  std::vector<std::string> venue_types;
+  std::string network;
+  // All: the co-members of every such venue together, with no per-venue quota.
+  // LowestId: only the venue with the lowest id. Random: one venue, drawn once
+  // and then held (for the run on a standing rule, for the trip on a hop rule).
+  enum class VenueChoice { All, LowestId, Random };
+  std::optional<VenueChoice> venue_choice;  // unset means All
+};
+
 struct FollowConfig {
   bool enabled = false;
 
@@ -872,12 +969,8 @@ struct FollowConfig {
   // HDF5 group token (non-empty, no '/').
   std::string name;
 
-  // Pool. Set exactly one. Venue co-members must live with the host (a
-  // household), so the pool is entirely on the host's rank and needs no
-  // messaging. A network draws the host's partner list, whose members can live
-  // in other domains, so enrolment and mirroring are routed across ranks.
-  std::string pool_venue_type;  // co-members of the host's venue of this type
-  std::string network;          // OR the host's partners in this network
+  // Pool: who a host can draw followers from. See FollowPool.
+  FollowPool pool;
 
   // Establishment: how a follower binds to a host. Stochastic rolls a per-host
   // probability, keyed so the outcome is the same at any rank count. Criteria
@@ -887,7 +980,14 @@ struct FollowConfig {
   Establishment establishment = Establishment::Stochastic;
   double probability = 1.0;  // stochastic only: per-host chance to enrol
 
-  // Criteria only: who becomes a follower, and who may host them. Each list is
+  // Optional limit on followers per host, for any establishment. A host with
+  // more eligible followers than this keeps the ones with the lowest hash of
+  // (seed, host, person); the rest stay unbound under this rule. Unset means
+  // everyone eligible follows.
+  std::optional<int> max_followers;
+
+  // Who becomes a follower, and who may host them, under either establishment
+  // mode. Each list is
   // a conjunction, so every criterion must hold and an empty list matches
   // everyone. These are the same person criteria policies and seeds take, which
   // is why the engine knows nothing about age here: whether a follower is a
@@ -928,14 +1028,14 @@ struct FollowConfig {
   bool log = false;            // log each follow when it forms (can be many)
 
   // Filled in by CoordinatedEncounterConfig::resolve against the world:
-  int pool_venue_type_id = -1;
+  std::vector<int> pool_venue_type_ids;
   int network_idx = -1;
   uint8_t encounter_type_id = kDefaultEncounterTypeId;
   std::vector<int16_t> activity_exception_ids;
   std::vector<uint8_t> venue_exception_type_ids;
   std::vector<int16_t> follower_activity_exception_ids;
 
-  bool usesNetwork() const { return !network.empty(); }
+  bool usesNetwork() const { return !pool.network.empty(); }
   bool usesCriteria() const { return establishment == Establishment::Criteria; }
 };
 
@@ -966,11 +1066,10 @@ struct PreferenceProfile {
   // Map of venue_type -> weight
   std::unordered_map<std::string, double> preference_weights;
 
-  bool appliesTo(const Person& person, const std::string& activity_name,
+  // Selection only. The activity is compared by id in getWeight, once
+  // resolve has turned the name into activity_id.
+  bool appliesTo(const Person& person,
                  const WorldState* world = nullptr) const {
-    // Must match activity name
-    if (!activity.empty() && activity != activity_name) return false;
-
     return matchesAllCriteria(person, selection_criteria, world);
   }
 
@@ -990,9 +1089,7 @@ struct ActivityPreferenceConfig {
       if (profile.activity_id != -1 && profile.activity_id != activity_id)
         continue;
 
-      if (profile.appliesTo(
-              person, "",
-              world)) {  // Empty string skip activity check in profile
+      if (profile.appliesTo(person, world)) {
         if (venue_type_id < profile.weights_by_id.size()) {
           return profile.weights_by_id[venue_type_id];
         }

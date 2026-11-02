@@ -227,7 +227,7 @@ void writeShardVaccine(H5::H5File& f, const std::vector<uint32_t>& ord,
   std::vector<std::string> vx_name;
   std::vector<int64_t> dose_off;
   std::vector<int32_t> dose_cnt, dose_num;
-  std::vector<double> d_admin, d_eff, d_wane, d_fin, d_wfac;
+  std::vector<double> d_admin, d_onset, d_eff, d_wane, d_fin, d_wfac;
   for (uint32_t idx : ord) {
     const Person& p = people[idx];
     if (!p.vaccine_trajectory) continue;
@@ -239,6 +239,7 @@ void writeShardVaccine(H5::H5File& f, const std::vector<uint32_t>& ord,
     for (const auto& d : vt.doses) {
       dose_num.push_back(d.number);
       d_admin.push_back(d.day_administered);
+      d_onset.push_back(d.days_to_onset);
       d_eff.push_back(d.days_to_effective);
       d_wane.push_back(d.days_to_waning);
       d_fin.push_back(d.days_to_finished);
@@ -254,6 +255,7 @@ void writeShardVaccine(H5::H5File& f, const std::vector<uint32_t>& ord,
   writeVec(f, "/vaccine/dose_counts", dose_cnt, I32, comp);
   writeVec(f, "/vaccine/dose_number", dose_num, I32, comp);
   writeVec(f, "/vaccine/dose_day_administered", d_admin, F64, comp);
+  writeVec(f, "/vaccine/dose_days_to_onset", d_onset, F64, comp);
   writeVec(f, "/vaccine/dose_days_to_effective", d_eff, F64, comp);
   writeVec(f, "/vaccine/dose_days_to_waning", d_wane, F64, comp);
   writeVec(f, "/vaccine/dose_days_to_finished", d_fin, F64, comp);
@@ -464,12 +466,15 @@ void writeShardIndex(const fs::path& tmp, int nranks) {
 // atomic commit marker for a complete checkpoint (see restoreFromCheckpoint).
 // world_path / world_sha256 are populated in P4 (restore validation);
 // intentionally empty here rather than a misleading placeholder.
+// format_version names the layout. The reader accepts only this one, so change
+// it together with readAndValidateManifest whenever a checkpoint gains or
+// loses data.
 void writeManifest(const fs::path& tmp, int completed_day,
                    const std::string& date_iso, int nranks,
                    double current_simulation_time, unsigned int random_seed) {
   YAML::Emitter m;
   m << YAML::BeginMap;
-  m << YAML::Key << "format_version" << YAML::Value << 1;
+  m << YAML::Key << "format_version" << YAML::Value << 3;
   m << YAML::Key << "completed_day" << YAML::Value << completed_day;
   m << YAML::Key << "date" << YAML::Value << date_iso;
   m << YAML::Key << "current_simulation_time" << YAML::Value
@@ -602,6 +607,73 @@ void Simulator::writeCheckpointStateFile(const fs::path& tmp, int completed_day,
       (int64_t)event_logger_.getCoordinatedEncounterCount()};
   writeVec(f, "/event_log/rank0_buffered_counts", ec,
            H5::PredType::NATIVE_INT64, 0);
+  // Observed metric totals and trigger state. Already reduced at the day
+  // boundary, so every rank holds the same numbers and one global file is
+  // enough. Written only when a metric is active, so a run without one adds
+  // nothing here. What is kept per unit (a metric counted per unit, or a
+  // trigger counted per unit) goes in one table of flat rows, led by the index
+  // of the metric or trigger it belongs to: a metric row is (metric, unit,
+  // value), holding the running total of a cumulative metric or the last day's
+  // count of a current one, which a voluntary response reads on the first day
+  // after a resume. A trigger row is (trigger, unit, closed, anchor day, anchor
+  // value).
+  if (policy_manager_) {
+    const auto metrics = policy_manager_->observedMetrics().snapshot();
+    if (!metrics.empty()) {
+      f.createGroup("/observed_metrics");
+      std::vector<std::string> names;
+      std::vector<int64_t> values;
+      std::vector<int64_t> scopes;
+      std::vector<int64_t> unit_rows;
+      for (const auto& m : metrics) {
+        for (const auto& [unit, total] : m.units)
+          unit_rows.insert(unit_rows.end(),
+                           {static_cast<int64_t>(names.size()), unit, total});
+        names.push_back(m.name);
+        values.push_back(m.value);
+        scopes.push_back(static_cast<int64_t>(m.scope));
+      }
+      writeStrs(f, "/observed_metrics/names", names);
+      writeVec(f, "/observed_metrics/values", values,
+               H5::PredType::NATIVE_INT64, 0);
+      writeVec(f, "/observed_metrics/scopes", scopes,
+               H5::PredType::NATIVE_INT64, 0);
+      writeVec(f, "/observed_metrics/unit_rows", unit_rows,
+               H5::PredType::NATIVE_INT64, 0);
+    }
+    // Three numbers per trigger for a world scope state: closed, anchor day,
+    // anchor value.
+    const auto triggers = policy_manager_->triggerStates();
+    if (!triggers.empty()) {
+      f.createGroup("/policy_triggers");
+      std::vector<std::string> keys;
+      std::vector<int64_t> state;
+      std::vector<int64_t> scopes;
+      std::vector<int64_t> voluntary;
+      std::vector<int64_t> unit_rows;
+      for (const auto& t : triggers) {
+        const int64_t index = static_cast<int64_t>(keys.size());
+        for (const auto& [unit, cell] : t.units)
+          unit_rows.insert(unit_rows.end(),
+                           {index, unit, cell.closed ? 1 : 0, cell.anchor_day,
+                            cell.anchor_value});
+        keys.push_back(t.key);
+        state.insert(state.end(), {t.cell.closed ? 1 : 0, t.cell.anchor_day,
+                                   t.cell.anchor_value});
+        scopes.push_back(static_cast<int64_t>(t.scope));
+        voluntary.push_back(t.voluntary ? 1 : 0);
+      }
+      writeStrs(f, "/policy_triggers/keys", keys);
+      writeVec(f, "/policy_triggers/state", state, H5::PredType::NATIVE_INT64,
+               0);
+      writeVec(f, "/policy_triggers/scopes", scopes, H5::PredType::NATIVE_INT64,
+               0);
+      writeVec(f, "/policy_triggers/voluntary", voluntary,
+               H5::PredType::NATIVE_INT64, 0);
+      writeVec(f, "/policy_triggers/unit_rows", unit_rows,
+               H5::PredType::NATIVE_INT64, 0);
+    }
+  }
   f.close();
 }
 

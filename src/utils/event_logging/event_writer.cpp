@@ -63,8 +63,7 @@ void writeHospitalDischargeEvents(
 void saveToHDF5WithLookups(
     const EventLogger& logger, const std::string& filename,
     const WorldState& world, const Config& config,
-    const std::unordered_set<PersonId>& infected_person_ids,
-    const std::unordered_set<PersonId>* person_ids_filter) {
+    const std::unordered_set<PersonId>& person_ids_filter) {
   if (mpi_runtime::state().rank == 0) {
     std::cout << "\n=== Saving Events + Lookup Tables to HDF5: " << filename
               << " ===" << std::endl;
@@ -109,13 +108,15 @@ void saveToHDF5WithLookups(
     writeDatasetTemplate(file, "/events/follows", logger.follows_,
                          event_schema::follow(),
                          config.simulation.compression_level);
+    writeDatasetTemplate(file, "/events/campaign_days", logger.campaign_days_,
+                         event_schema::campaignDay(),
+                         config.simulation.compression_level);
 
     // Always write lookups and metadata at the end, even if file exists
     event_writer_detail::openOrCreateGroup(file, "/lookups");
 
     if (config.simulation.save_full_person_details != "none") {
-      writePersonLookupTable(file, world, config, infected_person_ids, exists,
-                             person_ids_filter);
+      writePersonLookupTable(file, world, config, person_ids_filter, exists);
     }
     if (config.simulation.save_population_summary && !exists) {
       // Only write population summary once
@@ -126,8 +127,8 @@ void saveToHDF5WithLookups(
       writeVenueLookupTable(file, world, config);
     }
     if (config.simulation.save_person_activities != "none") {
-      writePersonActivitiesTable(file, world, config, infected_person_ids,
-                                 exists, person_ids_filter);
+      writePersonActivitiesTable(file, world, config, person_ids_filter,
+                                 exists);
     }
 
     H5::Group metadata_group =
@@ -149,6 +150,25 @@ void saveToHDF5WithLookups(
       follow_rule_names.push_back(f.name);
     event_writer_detail::writeStringDataset(registries_group, "follow_rules",
                                             follow_rule_names, false);
+
+    // campaign_id in /events/campaign_days indexes this, in config order.
+    // tier_id indexes the tier names of that campaign, kept in the group
+    // campaign_tiers under the campaign_id written as a number.
+    std::vector<std::string> campaign_names;
+    campaign_names.reserve(config.vaccination.campaigns.size());
+    for (const auto& c : config.vaccination.campaigns)
+      campaign_names.push_back(c.name);
+    event_writer_detail::writeStringDataset(registries_group, "campaigns",
+                                            campaign_names, false);
+    H5::Group tiers_group = event_writer_detail::openOrCreateGroup(
+        registries_group, "campaign_tiers");
+    for (size_t c = 0; c < config.vaccination.campaigns.size(); ++c) {
+      std::vector<std::string> tier_names;
+      for (const auto& tier : config.vaccination.campaigns[c].tiers)
+        tier_names.push_back(tier.name);
+      event_writer_detail::writeStringDataset(tiers_group, std::to_string(c),
+                                              tier_names, false);
+    }
 
     if (mpi_runtime::state().rank == 0) {
       std::cout << "Events and lookup tables saved successfully!" << std::endl;

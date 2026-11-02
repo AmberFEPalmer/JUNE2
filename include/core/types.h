@@ -54,6 +54,8 @@ constexpr uint8_t kNoSymptomId =
     255;  // absent infector symptom — registries stay well under 255 entries
 constexpr uint8_t kNoModeIndex =
     255;  // absent Transmission Mode — the disease loader caps modes below 255
+constexpr int64_t kNoAllotment =
+    -1;  // a vaccination campaign with no dose budget (unlimited)
 
 // =============================================================================
 // PendingInfection - Tracks infections that should be created later
@@ -75,11 +77,15 @@ struct PendingInfection {
 // =============================================================================
 // VisitorInfo - Lightweight visitor data for transmission calculations
 // =============================================================================
+enum class Sex : uint8_t { MALE = 0, FEMALE = 1, UNKNOWN = 2 };
+
 struct VisitorInfo {
   PersonId person_id;
   bool is_infected;
   float immunity_level;
   int32_t home_array_index = -1;  // For lookup on home rank
+  float age = 0.0f;               // Contact-matrix binning, as for a Person
+  Sex sex = Sex::UNKNOWN;
   uint16_t symptom_id = 0;
   double time_in_stage = 0.0;  // Compartmental deposition writeback only
 
@@ -251,8 +257,9 @@ struct ScheduleHop {
   }
 
   // Overwrite only the hop target; leave return_schedule_id and all progress
-  // fields intact. Use for freeze-in-place: caller has already saved
-  // return_schedule_id into FrozenPersonState for thaw to restore.
+  // fields intact. Freeze-in-place callers first save both targets into
+  // FrozenPersonState so thaw can restore them; a temporal policy cutting a
+  // hop short saves nothing, so the swap is final.
   void swapTarget(int16_t hop_idx) { hopped_schedule_id = hop_idx; }
 
   // Restore both target fields from a saved snapshot (thaw path).
@@ -268,8 +275,6 @@ struct ScheduleHop {
 // =============================================================================
 // Person - Represents an individual in the simulation
 // =============================================================================
-enum class Sex : uint8_t { MALE = 0, FEMALE = 1, UNKNOWN = 2 };
-
 struct Person {
   PersonId id;
   float age;
