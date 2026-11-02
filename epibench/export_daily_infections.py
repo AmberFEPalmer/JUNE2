@@ -94,8 +94,9 @@ def main():
         w = csv.writer(fh)
         w.writerow(["day", *codes])
         w.writerows([d, *row] for d, row in enumerate(counts.tolist()))
-    national = counts.sum(axis=1)
-    print(f"{args.out}: {n_days} days x {len(codes)} MSOAs, {int(national.sum()):,} infections, "
+    ### England only (E02 MSOAs), to match MetaWards; a 2021 E&W world also has Welsh W02 MSOAs
+    national = counts[:, [k for k, c in enumerate(codes) if c.startswith("E02")]].sum(axis=1)
+    print(f"{args.out}: {n_days} days x {len(codes)} MSOAs, {int(national.sum()):,} infections in England, "
           f"peak {int(national.max()):,}/day on day {int(national.argmax())}")
     if args.doubling_upper:
         print(f"doubling time {doubling_time(national, args.doubling_upper):.2f} days")
