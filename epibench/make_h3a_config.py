@@ -111,6 +111,12 @@ def main():
         raise ValueError("no beta values found in contact_matrices.yaml")
     (out / "contact_matrices.yaml").write_text(contacts)
 
+    ### JUNE2 since #54 rejects weights for venue types the world lacks (older versions dropped them); the
+    ### MAY 2021 world has "household" venues but no "residence" type, so drop that weight as before
+    prefs = (out / "activity_preferences.yaml").read_text()
+    prefs = _sub(prefs, r"\n\s*residence: 1\.0(?=\n|$)", "")
+    (out / "activity_preferences.yaml").write_text(prefs)
+
     if args.no_friendships:
         enc = (out / "coordinated_encounters.yaml").read_text()
         enc = _sub(enc, r'(name: "social_encounters"\s*\n\s*priority: \d+\s*\n\s*)enabled: true', r"\1enabled: false")
